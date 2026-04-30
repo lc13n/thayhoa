@@ -1,0 +1,7 @@
+dataset_beat/
+music_database.db
+kdtree.pkl
+*_download_log.txt
+download_log.txt
+__pycache__/
+*.pyc
