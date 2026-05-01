@@ -4,46 +4,50 @@ import numpy as np
 import librosa
 import sqlite3
 import pickle
-from scipy.spatial import KDTree
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 
 DATASET_DIR = "dataset_beat"
 DB_FILE     = "music_database.db"
-KDTREE_FILE = "kdtree.pkl"
 SR          = 44100
+WINDOW_SEC  = 10
+STEP_SEC    = 5
+N_WORKERS   = max(1, multiprocessing.cpu_count() - 1)
 
 
-def extract_features(file_path):
-    """
-    Trích xuất vector 18 chiều từ file WAV:
-      [pitch, zcr, energy, centroid, bandwidth, mfcc_1..mfcc_13]
-    """
-    audio, sr = librosa.load(file_path, sr=SR, mono=True)
-
-    # 1. Pitch — tần số cơ bản (Hz), nhận diện giai điệu
+def extract_features(audio, sr):
+    """Trích xuất vector 18 chiều từ audio array."""
     f0, voiced_flag, _ = librosa.pyin(
         audio,
         fmin=librosa.note_to_hz("C2"),
-        fmax=librosa.note_to_hz("C7")
+        fmax=librosa.note_to_hz("C7"),
+        sr=sr
     )
-    pitch = float(np.nanmean(f0[voiced_flag])) if voiced_flag.any() else 0.0
-
-    # 2. Zero-Crossing Rate — tốc độ đổi dấu tín hiệu
-    zcr = float(np.mean(librosa.feature.zero_crossing_rate(audio)))
-
-    # 3. Average Energy — năng lượng trung bình
-    energy = float(np.mean(audio ** 2))
-
-    # 4. Spectral Centroid — trọng tâm phổ (Hz)
-    centroid = float(np.mean(librosa.feature.spectral_centroid(y=audio, sr=sr)))
-
-    # 5. Spectral Bandwidth — băng thông phổ
+    pitch     = float(np.nanmean(f0[voiced_flag])) if voiced_flag.any() else 0.0
+    zcr       = float(np.mean(librosa.feature.zero_crossing_rate(audio)))
+    energy    = float(np.mean(audio ** 2))
+    centroid  = float(np.mean(librosa.feature.spectral_centroid(y=audio, sr=sr)))
     bandwidth = float(np.mean(librosa.feature.spectral_bandwidth(y=audio, sr=sr)))
-
-    # 6. MFCC — 13 hệ số đặc trưng âm sắc
-    mfcc      = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=13)
-    mfcc_mean = mfcc.mean(axis=1).tolist()
-
+    mfcc_mean = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=13).mean(axis=1).tolist()
     return [pitch, zcr, energy, centroid, bandwidth] + mfcc_mean
+
+
+def extract_features_from_file(file_path):
+    audio, sr = librosa.load(file_path, sr=SR, mono=True)
+    return extract_features(audio, sr)
+
+
+def process_file(file_path):
+    """Xử lý toàn bộ một file WAV, trả về list (name, file_path, offset, features)."""
+    window_len = WINDOW_SEC * SR
+    step_len   = STEP_SEC * SR
+    name = os.path.splitext(os.path.basename(file_path))[0].replace("_", " ")
+    audio, sr = librosa.load(file_path, sr=SR, mono=True)
+    results = []
+    for start in range(0, len(audio) - window_len + 1, step_len):
+        window = audio[start : start + window_len]
+        results.append((name, file_path, start / SR, extract_features(window, sr)))
+    return results
 
 
 def init_db(conn):
@@ -52,52 +56,61 @@ def init_db(conn):
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
             name      TEXT NOT NULL,
             file_path TEXT NOT NULL,
-            pitch     REAL,
-            zcr       REAL,
-            energy    REAL,
-            centroid  REAL,
-            bandwidth REAL,
+            offset    REAL NOT NULL,
             features  BLOB NOT NULL
         )
     """)
     conn.commit()
 
 
-def insert_song(conn, name, file_path, features):
+def insert_window(conn, name, file_path, offset, features):
     blob = pickle.dumps(np.array(features, dtype=np.float32))
     conn.execute(
-        """INSERT INTO songs
-           (name, file_path, pitch, zcr, energy, centroid, bandwidth, features)
-           VALUES (?,?,?,?,?,?,?,?)""",
-        (name, file_path,
-         features[0], features[1], features[2], features[3], features[4],
-         blob)
+        "INSERT INTO songs (name, file_path, offset, features) VALUES (?,?,?,?)",
+        (name, file_path, offset, blob)
+    )
+    conn.commit()
+
+
+def insert_windows_batch(conn, rows):
+    """Chèn tất cả windows của 1 file cùng lúc — nhanh hơn commit từng row."""
+    data = [
+        (name, fp, offset, pickle.dumps(np.array(feats, dtype=np.float32)))
+        for name, fp, offset, feats in rows
+    ]
+    conn.executemany(
+        "INSERT INTO songs (name, file_path, offset, features) VALUES (?,?,?,?)",
+        data
     )
     conn.commit()
 
 
 def load_all_songs(conn):
     rows = conn.execute(
-        "SELECT id, name, file_path, features FROM songs"
+        "SELECT id, name, file_path, offset, features FROM songs"
     ).fetchall()
     return [
-        {"id": r[0], "name": r[1], "path": r[2],
-         "features": pickle.loads(r[3])}
+        {"id": r[0], "name": r[1], "path": r[2], "offset": r[3],
+         "features": pickle.loads(r[4])}
         for r in rows
     ]
 
 
-def build_kdtree(songs):
-    vectors = np.array([s["features"] for s in songs], dtype=np.float32)
-    return KDTree(vectors), vectors
-
-
 def build_database():
+    # Xóa DB cũ nếu schema cũ (chưa có cột offset)
+    if os.path.exists(DB_FILE):
+        _conn = sqlite3.connect(DB_FILE)
+        cols = [r[1] for r in _conn.execute("PRAGMA table_info(songs)").fetchall()]
+        _conn.close()
+        if "offset" not in cols:
+            print("Phát hiện DB cũ → xóa và build lại.\n")
+            os.remove(DB_FILE)
+
     conn = sqlite3.connect(DB_FILE)
     init_db(conn)
 
-    existing = set(
-        r[0] for r in conn.execute("SELECT file_path FROM songs").fetchall()
+    existing_paths = set(
+        r[0] for r in conn.execute("SELECT DISTINCT file_path FROM songs").fetchall()
     )
 
     wav_files = sorted([
@@ -105,51 +118,47 @@ def build_database():
         if f.endswith(".wav") and not f.startswith("_temp")
     ])
 
+    todo = [
+        os.path.join(DATASET_DIR, f)
+        for f in wav_files
+        if os.path.join(DATASET_DIR, f) not in existing_paths
+    ]
+
     total     = len(wav_files)
+    skipped   = total - len(todo)
     new_count = 0
     t_start   = time.time()
 
-    print(f"Tìm thấy {total} file WAV trong '{DATASET_DIR}'\n")
+    print(f"Tìm thấy {total} file WAV trong '{DATASET_DIR}'")
+    print(f"Bỏ qua (đã có): {skipped} | Cần xử lý: {len(todo)}")
+    print(f"Window: {WINDOW_SEC}s | Step: {STEP_SEC}s | Workers: {N_WORKERS}\n")
 
-    for idx, filename in enumerate(wav_files, 1):
-        file_path = os.path.join(DATASET_DIR, filename)
+    with ProcessPoolExecutor(max_workers=N_WORKERS) as executor:
+        futures = {executor.submit(process_file, fp): fp for fp in todo}
 
-        if file_path in existing:
-            print(f"  [{idx:3}/{total}] Bỏ qua (đã có): {filename}")
-            continue
+        done = 0
+        for future in as_completed(futures):
+            fp   = futures[future]
+            done += 1
+            fname = os.path.basename(fp)
+            try:
+                t0   = time.time()
+                rows = future.result()
+                insert_windows_batch(conn, rows)
+                new_count += 1
+                print(f"  [{done:3}/{len(todo)}] {fname}: {len(rows)} windows | {time.time()-t0:.1f}s")
+            except Exception as e:
+                print(f"  [{done:3}/{len(todo)}] {fname}: Lỗi - {e}")
 
-        name = os.path.splitext(filename)[0].replace("_", " ")
-        print(f"  [{idx:3}/{total}] Trích xuất: {filename}")
-
-        try:
-            t0       = time.time()
-            features = extract_features(file_path)
-            elapsed  = time.time() - t0
-            insert_song(conn, name, file_path, features)
-            new_count += 1
-            print(f"          pitch={features[0]:7.1f}Hz | zcr={features[1]:.4f} | "
-                  f"energy={features[2]:.6f} | ({elapsed:.1f}s)")
-        except Exception as e:
-            print(f"          ✗ Lỗi: {e}")
-
-    songs = load_all_songs(conn)
+    songs      = load_all_songs(conn)
     conn.close()
-
-    if not songs:
-        print("DB trống.")
-        return
-
-    tree, _ = build_kdtree(songs)
-    with open(KDTREE_FILE, "wb") as f:
-        pickle.dump({"tree": tree, "songs": songs}, f)
-
     total_time = time.time() - t_start
+
     print(f"\n{'='*55}")
-    print(f"Tổng bài trong DB  : {len(songs)}")
-    print(f"Thêm mới lần này   : {new_count}")
-    print(f"Số chiều vector    : {len(songs[0]['features'])}")
-    print(f"Thời gian xử lý    : {total_time:.1f}s")
-    print(f"KD-Tree            : {KDTREE_FILE}")
+    print(f"Tong bai trong DB  : {len(set(s['name'] for s in songs))}")
+    print(f"Tong windows       : {len(songs)}")
+    print(f"Them moi lan nay   : {new_count}")
+    print(f"Thoi gian xu ly    : {total_time:.1f}s")
     print(f"Database           : {DB_FILE}")
 
 
